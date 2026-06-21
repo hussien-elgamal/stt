@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ara-Nemotron · Real-time Streaming ASR</title>
+  <meta name="description" content="Real-time Arabic streaming speech recognition powered by Ara-Nemotron 0.6B on RTX 3080" />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ─────────────────────────────────────────────────────────────────────
+       Design tokens
+    ───────────────────────────────────────────────────────────────────── */
+    :root {
+      --bg-base     : #080b12;
+      --bg-surface  : #0d1117;
+      --bg-card     : rgba(255,255,255,0.035);
+      --bg-card-hov : rgba(255,255,255,0.06);
+      --border      : rgba(255,255,255,0.08);
+      --border-glow : rgba(99,179,237,0.35);
+
+      --accent-cyan : #38bdf8;
+      --accent-purple: #a78bfa;
+      --accent-green : #34d399;
+      --accent-red   : #f87171;
+      --accent-amber : #fbbf24;
+
+      --txt-primary  : #e2e8f0;
+      --txt-secondary: #64748b;
+      --txt-muted    : #334155;
+
+      --radius       : 12px;
+      --radius-sm    : 8px;
+      --shadow-glow  : 0 0 40px rgba(56,189,248,0.12), 0 0 80px rgba(167,139,250,0.07);
+
+      --transition   : 0.22s cubic-bezier(0.4,0,0.2,1);
+    }
+
+    /* ─────────────────────────────────────────────────────────────────────
+       Reset
+    ───────────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg-base);
+      color: var(--txt-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ─────────────────────────────────────────────────────────────────────
+       Ambient background blobs
+    ───────────────────────────────────────────────────────────────────── */
+    body::before, body::after {
+      content: '';
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::before {
+      width: 600px; height: 600px;
+      top: -200px; left: -200px;
+      background: radial-gradient(circle, rgba(99,102,241,0.12) 0%, transparent 70%);
+    }
+    body::after {
+      width: 500px; height: 500px;
+      bottom: -150px; right: -150px;
+      background: radial-gradient(circle, rgba(56,189,248,0.10) 0%, transparent 70%);
+    }
+
+    /* ─────────────────────────────────────────────────────────────────────
+       Layout
+    ───────────────────────────────────────────────────────────────────── */
+    .page {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 28px 24px 48px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    /* ─── Header ──── */
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .logo-area h1 {
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, var(--accent-cyan) 0%, var(--accent-purple) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .logo-area p {
+      font-size: 0.78rem;
+      color: var(--txt-secondary);
+      margin-top: 3px;
+      font-weight: 400;
+    }
+
+    /* Connection badge */
+    .conn-badge {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--txt-secondary);
+      transition: var(--transition);
+      white-space: nowrap;
+    }
+    .conn-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--txt-muted);
+      transition: var(--transition);
+    }
+    .conn-badge.connected   .conn-dot { background: var(--accent-green); box-shadow: 0 0 8px var(--accent-green); }
+    .conn-badge.connected             { color: var(--accent-green); border-color: rgba(52,211,153,0.25); }
+    .conn-badge.recording   .conn-dot { background: var(--accent-red); box-shadow: 0 0 8px var(--accent-red); animation: pulse-dot 1s infinite; }
+    .conn-badge.recording             { color: var(--accent-red); border-color: rgba(248,113,113,0.25); }
+    .conn-badge.error       .conn-dot { background: var(--accent-amber); }
+    .conn-badge.error                 { color: var(--accent-amber); border-color: rgba(251,191,36,0.25); }
+
+    @keyframes pulse-dot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50%       { transform: scale(1.4); opacity: 0.7; }
+    }
+
+    /* ─── Visualizer ──── */
+    .viz-wrapper {
+      position: relative;
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+    }
+    #vizCanvas {
+      display: block;
+      width: 100%;
+      height: 80px;
+    }
+
+    /* ─── Controls ──── */
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    #recordBtn {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 13px 28px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      transition: var(--transition);
+      overflow: hidden;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      color: #fff;
+      box-shadow: 0 4px 24px rgba(56,189,248,0.25);
+    }
+    #recordBtn::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: rgba(0,0,0,0);
+      transition: var(--transition);
+    }
+    #recordBtn:hover::before  { background: rgba(0,0,0,0.12); }
+    #recordBtn:active::before { background: rgba(0,0,0,0.22); }
+    #recordBtn:disabled { opacity: 0.45; cursor: not-allowed; }
+    #recordBtn.recording {
+      background: linear-gradient(135deg, #f87171, #fb923c);
+      box-shadow: 0 4px 24px rgba(248,113,113,0.30);
+      animation: btn-glow 1.8s ease-in-out infinite;
+    }
+    @keyframes btn-glow {
+      0%, 100% { box-shadow: 0 4px 24px rgba(248,113,113,0.30); }
+      50%       { box-shadow: 0 4px 40px rgba(248,113,113,0.55); }
+    }
+
+    .btn-icon { font-size: 1.1rem; }
+
+    /* Stats strip */
+    .stats-strip {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      margin-left: auto;
+    }
+    .stat {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+    }
+    .stat-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem;
+      font-weight: 500;
+      color: var(--txt-primary);
+    }
+    .stat-label {
+      font-size: 0.65rem;
+      color: var(--txt-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .stat-value.good    { color: var(--accent-green);  }
+    .stat-value.ok      { color: var(--accent-amber);  }
+    .stat-value.bad     { color: var(--accent-red);    }
+
+    /* ─── Transcript panels ──── */
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 620px) { .panels { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      backdrop-filter: blur(10px);
+      transition: border-color var(--transition);
+    }
+    .panel:hover { border-color: rgba(255,255,255,0.14); }
+    .panel.active { border-color: var(--border-glow); box-shadow: var(--shadow-glow); }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .panel-title {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.10em;
+      color: var(--txt-secondary);
+    }
+    .panel-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+    }
+    .panel-dot.cyan   { background: var(--accent-cyan); }
+    .panel-dot.purple { background: var(--accent-purple); }
+
+    .panel-action {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--txt-muted);
+      font-size: 0.75rem;
+      padding: 3px 8px;
+      border-radius: 4px;
+      transition: var(--transition);
+    }
+    .panel-action:hover { color: var(--txt-secondary); background: var(--bg-card-hov); }
+
+    /* Live partial text */
+    #partialBox {
+      min-height: 120px;
+      font-size: 1.18rem;
+      font-weight: 400;
+      line-height: 1.7;
+      color: var(--txt-primary);
+      direction: rtl;
+      text-align: right;
+      font-family: 'Inter', 'Segoe UI', Tahoma, sans-serif;
+      /* Animated caret */
+      caret-color: var(--accent-cyan);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #partialBox .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 1.1em;
+      background: var(--accent-cyan);
+      vertical-align: text-bottom;
+      margin-right: 2px;
+      animation: blink 0.9s step-end infinite;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0; }
+    }
+    .placeholder-txt {
+      color: var(--txt-muted);
+      font-size: 0.88rem;
+      font-style: italic;
+      direction: ltr;
+      text-align: left;
+    }
+
+    /* Final log */
+    #finalLog {
+      min-height: 120px;
+      max-height: 340px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #finalLog::-webkit-scrollbar        { width: 4px; }
+    #finalLog::-webkit-scrollbar-track  { background: transparent; }
+    #finalLog::-webkit-scrollbar-thumb  { background: var(--border); border-radius: 4px; }
+
+    .log-entry {
+      padding: 10px 14px;
+      border-radius: var(--radius-sm);
+      background: rgba(255,255,255,0.03);
+      border-left: 3px solid var(--accent-purple);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      animation: slide-in 0.2s ease-out;
+    }
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0);   }
+    }
+    .log-text {
+      font-size: 1.0rem;
+      line-height: 1.6;
+      color: var(--txt-primary);
+      direction: rtl;
+      text-align: right;
+      font-family: 'Inter', 'Segoe UI', Tahoma, sans-serif;
+    }
+    .log-meta {
+      font-size: 0.65rem;
+      color: var(--txt-muted);
+      font-family: 'JetBrains Mono', monospace;
+      display: flex;
+      gap: 10px;
+    }
+    .log-placeholder {
+      color: var(--txt-muted);
+      font-size: 0.83rem;
+      font-style: italic;
+      margin: auto;
+      text-align: center;
+    }
+
+    /* ─── Info bar ──── */
+    .info-bar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 10px 16px;
+      border-radius: var(--radius-sm);
+      background: rgba(56,189,248,0.05);
+      border: 1px solid rgba(56,189,248,0.12);
+      font-size: 0.75rem;
+      color: var(--txt-secondary);
+    }
+    .info-bar span { display: flex; align-items: center; gap: 5px; }
+    .info-bar span::before { content: '▸'; color: var(--accent-cyan); }
+
+    /* ─── Error toast ──── */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #1e1010;
+      border: 1px solid rgba(248,113,113,0.30);
+      color: var(--accent-red);
+      padding: 10px 22px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1);
+      z-index: 999;
+      pointer-events: none;
+    }
+    #toast.visible { transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+
+<body>
+<div class="page">
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header>
+    <div class="logo-area">
+      <h1>Ara-Nemotron ASR</h1>
+      <p>FastConformer-RNNT · 0.6B · Real-time Streaming · Arabic / Egyptian Arabic</p>
+    </div>
+    <div class="conn-badge" id="connBadge">
+      <span class="conn-dot"></span>
+      <span id="connLabel">Disconnected</span>
+    </div>
+  </header>
+
+  <!-- ── Waveform visualizer ──────────────────────────────────────────────── -->
+  <div class="viz-wrapper">
+    <canvas id="vizCanvas"></canvas>
+  </div>
+
+  <!-- ── Controls ─────────────────────────────────────────────────────────── -->
+  <div class="controls">
+    <button id="recordBtn" disabled>
+      <span class="btn-icon" id="btnIcon">🎙️</span>
+      <span id="btnLabel">Start Recording</span>
+    </button>
+
+    <div class="stats-strip">
+      <div class="stat">
+        <span class="stat-value" id="statLatency">—</span>
+        <span class="stat-label">Latency</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statChunks">0</span>
+        <span class="stat-label">Chunks</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statFinals">0</span>
+        <span class="stat-label">Utterances</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Transcript panels ─────────────────────────────────────────────────── -->
+  <div class="panels">
+
+    <!-- Live partial -->
+    <div class="panel" id="partialPanel">
+      <div class="panel-header">
+        <span class="panel-title">
+          <span class="panel-dot cyan"></span>
+          Live Partial
+        </span>
+        <button class="panel-action" onclick="clearPartial()">Clear</button>
+      </div>
+      <div id="partialBox">
+        <span class="placeholder-txt">Partial transcript appears here while you speak…</span>
+      </div>
+    </div>
+
+    <!-- Final log -->
+    <div class="panel" id="finalPanel">
+      <div class="panel-header">
+        <span class="panel-title">
+          <span class="panel-dot purple"></span>
+          Final Transcript Log
+        </span>
+        <button class="panel-action" onclick="clearFinals()">Clear</button>
+      </div>
+      <div id="finalLog">
+        <span class="log-placeholder">Final sentences appear here after each pause…</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Info bar ──────────────────────────────────────────────────────────── -->
+  <div class="info-bar">
+    <span>16 kHz mono PCM</span>
+    <span>250 ms chunks</span>
+    <span>WebSocket binary</span>
+    <span>Energy VAD endpointing</span>
+    <span>RTX 3080 GPU</span>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     JavaScript
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+<script>
+'use strict';
+
+/* ─── Config ─────────────────────────────────────────────────────────────── */
+const WS_URL         = `ws://${location.host}/ws/transcribe`;
+const TARGET_SR      = 16000;     // model sample-rate
+const CHUNK_MS       = 250;       // send one chunk every N ms
+const SCRIPT_BUFSIZE = 4096;      // ScriptProcessor buffer size
+
+/* ─── State ──────────────────────────────────────────────────────────────── */
+let ws            = null;
+let audioCtx      = null;
+let mediaStream   = null;
+let processor     = null;
+let sampleBuffer  = [];           // accumulated Float32 samples
+let isRecording   = false;
+let chunkTimer    = null;
+
+let nativeSR      = 0;            // actual AudioContext sample-rate
+let chunkCount    = 0;
+let finalCount    = 0;
+let latencySum    = 0;
+let latencyN      = 0;
+
+/* ─── DOM refs ───────────────────────────────────────────────────────────── */
+const recordBtn   = document.getElementById('recordBtn');
+const btnIcon     = document.getElementById('btnIcon');
+const btnLabel    = document.getElementById('btnLabel');
+const connBadge   = document.getElementById('connBadge');
+const connLabel   = document.getElementById('connLabel');
+const partialBox  = document.getElementById('partialBox');
+const finalLog    = document.getElementById('finalLog');
+const partialPanel= document.getElementById('partialPanel');
+const finalPanel  = document.getElementById('finalPanel');
+const statLatency = document.getElementById('statLatency');
+const statChunks  = document.getElementById('statChunks');
+const statFinals  = document.getElementById('statFinals');
+const vizCanvas   = document.getElementById('vizCanvas');
+const toast       = document.getElementById('toast');
+
+/* ─── Canvas visualizer ─────────────────────────────────────────────────── */
+const ctx2d = vizCanvas.getContext('2d');
+let   analyser = null;
+let   vizData  = null;
+let   vizRAF   = null;
+
+function resizeCanvas() {
+  vizCanvas.width  = vizCanvas.offsetWidth  * devicePixelRatio;
+  vizCanvas.height = vizCanvas.offsetHeight * devicePixelRatio;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+function drawViz() {
+  vizRAF = requestAnimationFrame(drawViz);
+  const W = vizCanvas.width, H = vizCanvas.height;
+  ctx2d.clearRect(0, 0, W, H);
+
+  // Background
+  ctx2d.fillStyle = '#0d1117';
+  ctx2d.fillRect(0, 0, W, H);
+
+  if (!analyser || !vizData) {
+    // Idle flatline
+    ctx2d.strokeStyle = 'rgba(56,189,248,0.15)';
+    ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, H / 2); ctx2d.lineTo(W, H / 2);
+    ctx2d.stroke();
+    return;
+  }
+
+  analyser.getByteTimeDomainData(vizData);
+
+  const mid = H / 2;
+  const grad = ctx2d.createLinearGradient(0, 0, W, 0);
+  grad.addColorStop(0,   'rgba(99,102,241,0.8)');
+  grad.addColorStop(0.5, 'rgba(56,189,248,0.9)');
+  grad.addColorStop(1,   'rgba(167,139,250,0.8)');
+
+  ctx2d.strokeStyle = grad;
+  ctx2d.lineWidth   = 2.0 * devicePixelRatio;
+  ctx2d.lineJoin    = 'round';
+  ctx2d.lineCap     = 'round';
+  ctx2d.shadowColor = '#38bdf8';
+  ctx2d.shadowBlur  = 6;
+
+  ctx2d.beginPath();
+  const step = W / vizData.length;
+  for (let i = 0; i < vizData.length; i++) {
+    const v = (vizData[i] / 128.0 - 1.0) * (H * 0.42);
+    const x = i * step, y = mid + v;
+    i === 0 ? ctx2d.moveTo(x, y) : ctx2d.lineTo(x, y);
+  }
+  ctx2d.stroke();
+  ctx2d.shadowBlur = 0;
+}
+drawViz();
+
+/* ─── WebSocket ──────────────────────────────────────────────────────────── */
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    setConnState('connected', 'Connected');
+    recordBtn.disabled = false;
+  };
+
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+
+    if (msg.type === 'partial') {
+      showPartial(msg.text);
+      updateLatency(msg.latency_ms);
+    } else if (msg.type === 'final') {
+      appendFinal(msg.text, msg.latency_ms);
+      clearPartialDisplay();
+    } else if (msg.type === 'eos') {
+      // server acknowledged end-of-stream
+    } else if (msg.type === 'error') {
+      showToast('Server error: ' + msg.message);
+    } else if (msg.type === 'pong') {
+      // keepalive ack
+    }
+  };
+
+  ws.onerror = () => {
+    setConnState('error', 'Error');
+    showToast('WebSocket error — is the server running?');
+  };
+
+  ws.onclose = () => {
+    setConnState('disconnected', 'Disconnected');
+    recordBtn.disabled = true;
+    if (isRecording) stopRecording();
+    // Auto-reconnect after 3 s
+    setTimeout(connectWS, 3000);
+  };
+}
+
+/* ─── UI state helpers ───────────────────────────────────────────────────── */
+function setConnState(cls, label) {
+  connBadge.className = 'conn-badge ' + cls;
+  connLabel.textContent = label;
+}
+
+function showPartial(text) {
+  partialPanel.classList.add('active');
+  partialBox.innerHTML =
+    `<span style="direction:rtl;text-align:right;display:block">${escHtml(text)}</span>` +
+    `<span class="cursor"></span>`;
+}
+
+function clearPartialDisplay() {
+  partialPanel.classList.remove('active');
+  partialBox.innerHTML = '';
+}
+
+function clearPartial() {
+  clearPartialDisplay();
+}
+
+function appendFinal(text, latMs) {
+  // Remove placeholder
+  const ph = finalLog.querySelector('.log-placeholder');
+  if (ph) ph.remove();
+
+  finalCount++;
+  statFinals.textContent = finalCount;
+
+  const ts = new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `
+    <div class="log-text">${escHtml(text)}</div>
+    <div class="log-meta">
+      <span>${ts}</span>
+      ${latMs ? `<span>${latMs} ms</span>` : ''}
+    </div>`;
+
+  finalLog.appendChild(entry);
+  finalPanel.classList.add('active');
+  finalLog.scrollTop = finalLog.scrollHeight;
+}
+
+function clearFinals() {
+  finalLog.innerHTML = '<span class="log-placeholder">Final sentences appear here after each pause…</span>';
+  finalCount = 0;
+  statFinals.textContent = '0';
+  finalPanel.classList.remove('active');
+}
+
+function updateLatency(ms) {
+  if (!ms) return;
+  latencySum += ms;
+  latencyN++;
+  const avg = Math.round(latencySum / latencyN);
+  statLatency.textContent = avg + ' ms';
+  statLatency.className = 'stat-value ' + (avg < 300 ? 'good' : avg < 700 ? 'ok' : 'bad');
+}
+
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('visible');
+  setTimeout(() => toast.classList.remove('visible'), 3500);
+}
+
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* ─── Audio capture + resampling ─────────────────────────────────────────── */
+
+/** Linear-interpolation downsampler. */
+function downsample(inputF32, fromSR, toSR) {
+  if (fromSR === toSR) return inputF32;
+  const ratio   = fromSR / toSR;
+  const outLen  = Math.floor(inputF32.length / ratio);
+  const out     = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const lo  = Math.floor(pos);
+    const hi  = Math.min(lo + 1, inputF32.length - 1);
+    const t   = pos - lo;
+    out[i]    = inputF32[lo] * (1 - t) + inputF32[hi] * t;
+  }
+  return out;
+}
+
+/** Float32 [-1,1] → Int16 PCM. */
+function float32ToInt16(f32) {
+  const i16 = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32768));
+  }
+  return i16;
+}
+
+/** Flush accumulated samples as one binary WebSocket frame. */
+function flushChunk() {
+  if (!sampleBuffer.length || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // Merge all buffered Float32 sub-arrays
+  const total   = sampleBuffer.reduce((s, a) => s + a.length, 0);
+  const merged  = new Float32Array(total);
+  let offset    = 0;
+  for (const arr of sampleBuffer) { merged.set(arr, offset); offset += arr.length; }
+  sampleBuffer  = [];
+
+  // Resample to 16 kHz if necessary
+  const resampled = downsample(merged, nativeSR, TARGET_SR);
+
+  // Convert to Int16 PCM and send
+  const pcm = float32ToInt16(resampled);
+  ws.send(pcm.buffer);
+
+  chunkCount++;
+  statChunks.textContent = chunkCount;
+}
+
+async function startRecording() {
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: TARGET_SR, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (e) {
+    showToast('Microphone access denied: ' + e.message);
+    return;
+  }
+
+  // Create AudioContext — request TARGET_SR (browser may ignore it on some platforms)
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_SR });
+  nativeSR = audioCtx.sampleRate;
+
+  const source  = audioCtx.createMediaStreamSource(mediaStream);
+
+  // Analyser for visualizer
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;
+  vizData  = new Uint8Array(analyser.frequencyBinCount);
+  source.connect(analyser);
+
+  // ScriptProcessor for raw PCM access
+  // eslint-disable-next-line no-undef
+  processor = audioCtx.createScriptProcessor(SCRIPT_BUFSIZE, 1, 1);
+  processor.onaudioprocess = (e) => {
+    if (!isRecording) return;
+    // Copy mono channel data
+    const raw = e.inputBuffer.getChannelData(0);
+    sampleBuffer.push(new Float32Array(raw));
+  };
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);   // required for onaudioprocess to fire
+
+  // Flush timer — sends one chunk every CHUNK_MS
+  chunkTimer = setInterval(flushChunk, CHUNK_MS);
+
+  isRecording = true;
+  setConnState('recording', 'Recording…');
+  recordBtn.classList.add('recording');
+  btnIcon.textContent  = '⏹️';
+  btnLabel.textContent = 'Stop Recording';
+}
+
+async function stopRecording() {
+  isRecording = false;
+  clearInterval(chunkTimer);
+
+  // Flush any remaining samples
+  flushChunk();
+
+  // Signal server: end of stream
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'end' }));
+  }
+
+  // Teardown
+  if (processor)    { processor.disconnect(); processor = null; }
+  if (analyser)     { analyser.disconnect();  analyser = null; vizData = null; }
+  if (mediaStream)  { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+  if (audioCtx)     { await audioCtx.close(); audioCtx = null; }
+
+  sampleBuffer = [];
+
+  setConnState('connected', 'Connected');
+  recordBtn.classList.remove('recording');
+  btnIcon.textContent  = '🎙️';
+  btnLabel.textContent = 'Start Recording';
+}
+
+/* ─── Button click ───────────────────────────────────────────────────────── */
+recordBtn.addEventListener('click', () => {
+  if (!isRecording) startRecording();
+  else              stopRecording();
+});
+
+/* ─── Boot ───────────────────────────────────────────────────────────────── */
+connectWS();
+</script>
+</body>
+</html>

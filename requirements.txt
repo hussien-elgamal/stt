@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────────
+#  Ara-Nemotron Streaming ASR — Pinned Requirements (Windows CUDA)
+#  Tested: Python 3.11  |  torch 2.5.1+cu121  |  RTX 3080
+#
+#  CRITICAL VERSION PINS — Do NOT upgrade without testing:
+#    pyarrow  must stay  < 18  (>= 24 causes Windows access violation)
+#    datasets must stay  < 3   (3.x requires pyarrow >= 21)
+#    numpy    must stay  < 2   (NeMo C-extensions break with numpy 2.x)
+# ─────────────────────────────────────────────────────────────────
+
+# Web Framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0
+python-multipart>=0.0.9
+
+# NeMo ASR (heavy — installs torch deps, apex, etc.)
+nemo_toolkit[asr]>=2.0.0
+
+# ⚠️  PINNED — Do NOT change these three without reading the notes above
+numpy>=1.24.0,<2.0.0
+pyarrow>=17.0.0,<18.0.0
+datasets>=2.18.0,<3.0.0
+
+# Utilities
+scipy>=1.11.0
+huggingface_hub>=0.22.0
+soundfile>=0.12.1

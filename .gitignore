@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+model/
+*.nemo
+*.wav
+*.mp3
+.DS_Store
