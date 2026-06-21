@@ -1,8 +1,11 @@
 """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Ara-Nemotron Streaming ASR — FastAPI Backend
-  Model : Abdelkareem/Ara-nemotron-3.5-asr-streaming-0.6b
-  Stack : FastAPI · NeMo · CUDA (RTX 3080)
+  Dual-Engine Streaming ASR — FastAPI Backend
+  Engine A : Ara-Nemotron (NVIDIA NeMo)
+  Engine B : Qwen3-ASR    (HuggingFace Transformers)
+  Stack    : FastAPI · WebSocket · CUDA (RTX 3080)
+
+  Select engine via: ASR_ENGINE=nemotron | qwen
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -52,17 +55,16 @@ with warnings.catch_warnings():
 import asyncio
 import json
 import logging
-import math
 import time
-import tempfile
 from contextlib import asynccontextmanager
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import FileResponse
+
+from engines import BaseASREngine, create_engine
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -82,9 +84,10 @@ for lib in ("nemo", "nemo_logger", "lightning", "torch.distributed"):
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration  (override via environment variables)
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_PATH    = os.getenv("MODEL_PATH", "./model")          # local dir or .nemo file
-MODEL_HF_ID   = "Abdelkareem/Ara-nemotron-3.5-asr-streaming-0.6b"
-SAMPLE_RATE   = 16_000                 # Hz — model expects 16 kHz mono PCM
+SAMPLE_RATE = 16_000                # Hz — both models expect 16 kHz mono PCM
+
+# Which engine to use: "nemotron" (default) or "qwen"
+ASR_ENGINE_NAME = os.getenv("ASR_ENGINE", "nemotron")
 
 # Silence / endpointing
 SILENCE_RMS_THRESHOLD  = float(os.getenv("SILENCE_RMS", "0.007"))
@@ -95,140 +98,66 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr_infer")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global model (loaded once at startup — stays resident on GPU)
+# Global engine instance (loaded once at startup — stays resident on GPU)
 # ─────────────────────────────────────────────────────────────────────────────
-asr_model: object = None
+asr_engine: BaseASREngine | None = None
+_current_engine_key: str = ASR_ENGINE_NAME   # tracks active engine name string
+_engine_switching: bool = False              # True while a hot-swap is in progress
+_engine_lock = asyncio.Lock()               # ensures only one switch at a time
 
 
-def _load_model() -> object:
-    """
-    Load NeMo ASR model from a local .nemo file, a local dir, or HuggingFace.
-
-    Loads as EncDecHybridRNNTCTCBPEModelWithPrompt (aliased via the compat stub
-    as EncDecRNNTBPEModelWithPrompt) so that transcribe() supports the
-    target_lang kwarg needed to force Arabic output from this multilingual model.
-    strict=False lets the missing aux-CTC weights be safely skipped.
-
-    PATCH 2 — The entire function body is wrapped in try/except so that any
-    error (ImportError, FileNotFoundError, CUDA OOM, C++ exception bubbling up
-    through ctypes, etc.) is logged with a full traceback BEFORE the thread
-    dies.  Without this, exceptions raised inside a ThreadPoolExecutor are
-    silently swallowed on Windows and the process exits without any output.
-    """
-    try:
-        import nemo.collections.asr as nemo_asr   # deferred — heavy import
-        from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models_prompt import (
-            EncDecHybridRNNTCTCBPEModelWithPrompt,
-        )
-
-        local = Path(MODEL_PATH)
-
-        def _restore(path: str):
-            """Restore with strict=False and WithPrompt class for target_lang support."""
-            log.info("  restore_from (WithPrompt, strict=False): %s", path)
-            try:
-                model = EncDecHybridRNNTCTCBPEModelWithPrompt.restore_from(
-                    restore_path=path,
-                    map_location="cpu",
-                    strict=False,
-                )
-                log.info("  Loaded as EncDecHybridRNNTCTCBPEModelWithPrompt (strict=False) ✔")
-                return model
-            except Exception as e1:
-                log.warning("  WithPrompt load failed: %s", e1)
-                log.warning("  Falling back to base ASRModel (no language prompt support)")
-                return nemo_asr.models.ASRModel.restore_from(
-                    restore_path=path,
-                    map_location="cpu",
-                    strict=False,
-                )
-
-        # 1) Explicit .nemo file
-        if local.is_file() and local.suffix == ".nemo":
-            log.info("  Loading from .nemo file: %s", local.resolve())
-            return _restore(str(local))
-
-        # 2) Directory containing a .nemo file
-        if local.is_dir():
-            nemo_files = sorted(local.glob("*.nemo"))
-            if nemo_files:
-                log.info("  Loading .nemo from dir: %s", nemo_files[0])
-                return _restore(str(nemo_files[0]))
-
-        # 3) Fall back to HuggingFace / NeMo NGC cache
-        log.info("  Downloading from HuggingFace: %s", MODEL_HF_ID)
-        return nemo_asr.models.ASRModel.from_pretrained(MODEL_HF_ID, map_location="cpu")
-
-    except Exception as e:  # noqa: BLE001
-        # ── CRITICAL: log full traceback so the real error is never hidden ──
-        log.exception(
-            "CRITICAL STARTUP ERROR — _load_model() raised an unhandled exception.\n"
-            "The server cannot continue.  Real error:\n"
-        )
-        # Re-raise so the executor future carries the exception and lifespan
-        # can surface it (see PATCH 3 in lifespan below).
-        raise
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifespan — model loading via Engine Factory
+# ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     PATCH 3 — Hardened lifespan that guarantees any startup failure is
     printed with a full traceback before the process dies.
 
-    Problem on Windows: if run_in_executor raises, the Future exception is
-    stored but asyncio may swallow it when the event-loop tears down, giving
-    the infamous "silent crash".  We explicitly await + re-raise inside a
-    try/except so log.exception() always fires first.
+    The engine is selected by the ASR_ENGINE environment variable, instantiated
+    via the factory, and loaded in a ThreadPoolExecutor so the event loop is
+    never blocked.
     """
-    global asr_model
+    global asr_engine
 
     log.info("═" * 62)
-    log.info("  Ara-Nemotron Streaming ASR  —  server starting…")
+    log.info("  Dual-Engine Streaming ASR  —  server starting…")
+    log.info("  ASR_ENGINE : %s", ASR_ENGINE_NAME)
     log.info("═" * 62)
     log.info("  torchaudio backend : %s", torchaudio.get_audio_backend())
     log.info("  torch version      : %s", torch.__version__)
     log.info("  CUDA available     : %s", torch.cuda.is_available())
 
     try:
-        # Load in a thread so the event-loop isn't blocked.
-        # We store the Future explicitly so we can inspect its exception.
-        loop = asyncio.get_event_loop()
-        future = loop.run_in_executor(_EXECUTOR, _load_model)
+        # 1. Select the engine via the factory (does NOT load model yet)
+        engine = create_engine(ASR_ENGINE_NAME)
 
-        # Await with a generous timeout so a hung load doesn't silently block.
+        # 2. Load the model in a thread so the event-loop isn't blocked.
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(_EXECUTOR, engine.load_model)
+
+        # 3. Await with a generous timeout to catch hung downloads / deadlocks.
         try:
-            asr_model = await asyncio.wait_for(future, timeout=600)  # 10 min max
+            await asyncio.wait_for(future, timeout=600)   # 10 min max
         except asyncio.TimeoutError:
             log.exception(
-                "CRITICAL STARTUP ERROR — _load_model() timed out after 600 s.\n"
-                "Check for a hung download or a deadlock in NeMo initialisation."
+                "CRITICAL STARTUP ERROR — engine.load_model() timed out after 600 s.\n"
+                "Check for a hung download or a deadlock in model initialisation."
             )
             raise RuntimeError("Model load timed out") from None
 
-        if asr_model is None:
-            raise RuntimeError("_load_model() returned None — check logs above")
+        asr_engine = engine
+        _current_engine_key = ASR_ENGINE_NAME
 
-        asr_model.eval()
-
-        # Move to GPU if available
-        if torch.cuda.is_available():
-            asr_model = asr_model.cuda()
-            vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-            log.info("  GPU  : %s (%.1f GB VRAM)", torch.cuda.get_device_name(0), vram)
-        else:
-            log.warning("  CUDA unavailable — running on CPU (expect high latency)")
-
-        log.info("  Model ready  ✓")
+        log.info("  Engine ready  ✓  [%s]", asr_engine.name)
         log.info("═" * 62)
 
-    except Exception as e:  # noqa: BLE001
-        # ── Guarantee the real error is visible before the process exits ──
+    except Exception:   # noqa: BLE001
         log.exception(
             "CRITICAL STARTUP ERROR — lifespan failed.  "
             "Server will NOT start.  Real error:\n"
         )
-        # Re-raise so uvicorn/starlette knows startup failed (exits non-zero)
         raise
 
     yield
@@ -239,8 +168,8 @@ async def lifespan(app: FastAPI):
 # FastAPI App
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Ara-Nemotron Streaming ASR",
-    version="1.0.0",
+    title="Dual-Engine Streaming ASR",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -252,14 +181,122 @@ async def serve_ui():
 
 @app.get("/health")
 async def health():
-    """Quick liveness + model-info endpoint."""
+    """Quick liveness + engine-info endpoint."""
     return {
-        "status"      : "ok",
-        "model_loaded": asr_model is not None,
+        "status"       : "ok",
+        "engine_loaded": asr_engine is not None,
+        "engine_type"  : asr_engine.name if asr_engine else None,
+        "cuda"         : torch.cuda.is_available(),
+        "device"       : torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "asr_engine_env": ASR_ENGINE_NAME,
+    }
+
+
+@app.get("/api/status")
+async def api_status():
+    """
+    Returns the currently active engine name and switching state.
+    Called by the UI to reflect the correct toggle state.
+    """
+    return {
+        "engine_name" : asr_engine.name if asr_engine else None,
+        "engine_key"  : _current_engine_key,
+        "switching"   : _engine_switching,
         "cuda"        : torch.cuda.is_available(),
         "device"      : torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
-        "model_id"    : MODEL_HF_ID,
     }
+
+
+def _free_engine_memory(engine) -> None:
+    """
+    Move old engine's model to CPU and release GPU memory.
+    Called after a hot-swap to free VRAM from the previous engine.
+    """
+    try:
+        import gc
+        model = getattr(engine, '_model', None)
+        if model is not None and hasattr(model, 'cpu'):
+            model.cpu()
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log.info("Released GPU memory from old engine: %s", engine.name)
+    except Exception as exc:
+        log.warning("Could not fully free engine memory (%s): %s", engine.name, exc)
+
+
+@app.post("/api/switch-engine")
+async def api_switch_engine(request: Request):
+    """
+    Hot-swap the active ASR engine without restarting the server.
+
+    Request body: {"engine": "nemotron" | "qwen"}
+
+    The new engine is loaded in the ThreadPoolExecutor (non-blocking).
+    Once ready, the global asr_engine is replaced atomically.
+    Old engine GPU memory is freed immediately after swap.
+    Existing WebSocket sessions keep using the old engine until they
+    disconnect; new sessions will use the new engine.
+    """
+    global asr_engine, _engine_switching, _current_engine_key
+
+    body = await request.json()
+    new_engine_name = body.get("engine", "").strip().lower()
+
+    if not new_engine_name:
+        raise HTTPException(status_code=400, detail="'engine' field is required")
+
+    if _engine_switching:
+        raise HTTPException(status_code=409, detail="An engine switch is already in progress — please wait")
+
+    # Already on this engine — no-op
+    if asr_engine is not None and new_engine_name == _current_engine_key:
+        return {"success": True, "engine": asr_engine.name, "engine_key": _current_engine_key,
+                "message": "Already using this engine"}
+
+    async with _engine_lock:
+        _engine_switching = True
+        try:
+            log.info("Hot-swap: %s → %s …", _current_engine_key, new_engine_name)
+
+            # 1. Build the new engine object (raises ValueError for unknown names)
+            try:
+                new_engine = create_engine(new_engine_name)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+            # 2. Load the model in a thread (may take minutes for large models)
+            loop = asyncio.get_event_loop()
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(_EXECUTOR, new_engine.load_model),
+                    timeout=600,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504,
+                                    detail="Engine load timed out (600 s) — check server logs")
+
+            # 3. Atomic swap
+            old_engine = asr_engine
+            asr_engine = new_engine
+            _current_engine_key = new_engine_name
+
+            # 4. Release old engine VRAM
+            if old_engine is not None:
+                _free_engine_memory(old_engine)
+
+            log.info("Hot-swap complete — now using %s", asr_engine.name)
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.exception("Hot-swap failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Engine switch failed: {exc}")
+        finally:
+            _engine_switching = False
+
+    return {"success": True, "engine": asr_engine.name, "engine_key": _current_engine_key}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,141 +304,83 @@ async def health():
 # ─────────────────────────────────────────────────────────────────────────────
 # How many samples to accumulate before re-running transcription (0.5 s)
 _TRANSCRIBE_EVERY_N_SAMPLES = SAMPLE_RATE // 2   # 8 000 @ 16 kHz
-# Maximum audio history kept for context (10 s)
-_MAX_CONTEXT_SAMPLES = SAMPLE_RATE * 10
+# Maximum audio history kept for context (30 s — Qwen supports up to 30 s)
+_MAX_CONTEXT_SAMPLES = SAMPLE_RATE * 30
+
+# Trivial engine outputs to ignore (silence artifacts)
+_TRIVIAL_OUTPUTS = {".", "،", "...", "..", ",", "!", "؟", "?"}
 
 
 class StreamingSession:
     """
-    Direct-tensor streaming ASR session — bypasses Lhotse/manifest entirely.
+    Engine-agnostic streaming ASR session.
 
-    Flow per chunk:
-      raw audio (float32) → preprocessor (mel) → encoder
-      → Arabic prompt injection (one-hot index-7 + prompt_kernel)
-      → RNNT greedy decoder → partial / final text
+    Responsibilities
+    ----------------
+    - Accumulate incoming PCM chunks.
+    - Apply RMS-based VAD to detect silence.
+    - Throttle inference calls (every ~0.5 s of new audio).
+    - Trigger 'final' events after sustained silence.
+    - Delegate all transcription to ``self.engine.run_inference(ctx)``.
 
-    Audio is accumulated and re-inferred every ~0.5 s on the last ≤10 s.
-    Sustained silence triggers a "final" event and resets the buffer.
+    The session holds NO model-specific code — it is fully decoupled from
+    NeMo, HuggingFace, or any other ASR backend.
     """
 
-    # Arabic language ID in the Nemotron prompt_dictionary
-    _ARABIC_PROMPT_IDX = 7
-
-    def __init__(self, model):
-        self.model   = model
-        self.device  = next(model.parameters()).device
+    def __init__(self, engine: BaseASREngine) -> None:
+        self.engine           = engine
         self._chunks: list[np.ndarray] = []
         self._pending_samples = 0
         self.silence_frames   = 0
         self.last_partial     = ""
         self.chunk_count      = 0
-
-        # Derive num_prompts from model config (default 128)
-        self.num_prompts = int(
-            getattr(model, 'num_prompts', None)
-            or model.cfg.model_defaults.get('num_prompts', 128)
-        )
-        self.has_prompt = getattr(model, 'concat', False) and hasattr(model, 'prompt_kernel')
-        log.info("StreamingSession init — prompt_kernel=%s  num_prompts=%d  device=%s",
-                 self.has_prompt, self.num_prompts, self.device)
+        self._session_text    = ""  # accumulates all finalized utterances this session
+        log.info("StreamingSession init — engine=%s", engine.name)
 
     # ── Reset ───────────────────────────────────────────────────────────────
-    def _reset_for_next_utterance(self):
+    def _reset_for_next_utterance(self) -> None:
         self._chunks          = []
         self._pending_samples = 0
         self.last_partial     = ""
         self.silence_frames   = 0
+        self.engine.reset_state()
 
     # ── Utility ─────────────────────────────────────────────────────────────
     @staticmethod
     def _rms(samples: np.ndarray) -> float:
         return float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0.0
 
-    # ── Core inference  (runs in ThreadPoolExecutor) ──────────────────────────
+    # ── Core inference  (runs in ThreadPoolExecutor) ─────────────────────────
     def _run_inference(self, samples: np.ndarray) -> str:
         """
-        Direct tensor forward pass — NO temp files, NO Lhotse, NO manifest.
+        Accumulate samples, build context window, delegate to engine.
 
-        Pipeline:
-            raw audio tensor [1,T]
-            → model.preprocessor  → mel [1,D,T']
-            → model.encoder       → encoded [1,C,T'']
-            → transpose           → [1,T'',C]
-            → concat + prompt_kernel (Arabic=idx 7) if supported
-            → transpose back      → [1,C,T'']
-            → decoding.rnnt_decoder_predictions_tensor
-            → text
+        This method is engine-agnostic:
+          1. Append new chunk to buffer.
+          2. Wait until 0.5 s of new audio is ready.
+          3. Build context window (last ≤ 10 s).
+          4. Call engine.run_inference(ctx) → return text.
         """
-        try:
-            self._chunks.append(samples)
-            self._pending_samples += len(samples)
+        self._chunks.append(samples)
+        self._pending_samples += len(samples)
 
-            # Wait until 0.5 s of new audio is accumulated
-            if self._pending_samples < _TRANSCRIBE_EVERY_N_SAMPLES:
-                return self.last_partial
-
-            self._pending_samples = 0
-
-            # Build context window (last ≤10 s)
-            ctx = np.concatenate(self._chunks)
-            if len(ctx) > _MAX_CONTEXT_SAMPLES:
-                ctx = ctx[-_MAX_CONTEXT_SAMPLES:]
-                self._chunks = [ctx]
-
-            # ── Prepare tensors ───────────────────────────────────────
-            audio_t   = torch.from_numpy(ctx).float().unsqueeze(0).to(self.device)   # [1,T]
-            audio_len = torch.tensor([ctx.shape[0]], dtype=torch.long, device=self.device)
-
-            with torch.inference_mode():
-                # Disable NeMo neural-type checks (safe for inference)
-                from nemo.core.classes.common import typecheck
-                with typecheck.disable_checks():
-                    # 1. Mel-spectrogram features
-                    processed, proc_len = self.model.preprocessor(
-                        input_signal=audio_t, length=audio_len
-                    )
-
-                    # 2. Encoder: [1,D,T'] → encoded [1,C,T'']
-                    encoded, enc_len = self.model.encoder(
-                        audio_signal=processed, length=proc_len
-                    )
-
-                # 3. Transpose for prompt injection: [1,C,T''] → [1,T'',C]
-                enc_t = encoded.transpose(1, 2)
-
-                # 4. Arabic prompt conditioning via prompt_kernel
-                if self.has_prompt:
-                    T_enc = enc_t.shape[1]
-                    prompt = torch.zeros(
-                        1, T_enc, self.num_prompts,
-                        dtype=enc_t.dtype, device=self.device
-                    )
-                    prompt[:, :, self._ARABIC_PROMPT_IDX] = 1.0   # ar-AR = 7
-                    enc_t = self.model.prompt_kernel(
-                        torch.cat([enc_t, prompt], dim=-1)
-                    ).to(encoded.dtype)
-
-                # 5. Transpose back: [1,T'',C] → [1,C,T'']
-                encoded_final = enc_t.transpose(1, 2)
-
-                # 6. RNNT greedy decode — returns list[str]
-                best_hyp = self.model.decoding.rnnt_decoder_predictions_tensor(
-                    encoder_output=encoded_final,
-                    encoded_lengths=enc_len,
-                    return_hypotheses=False,
-                )
-
-            if best_hyp:
-                h = best_hyp[0]
-                text = (h.text if hasattr(h, "text") else str(h)).strip()
-                if text:
-                    log.info("🎯 النص: %s", text)
-                return text
-
+        # Wait until 0.5 s of new audio is accumulated
+        if self._pending_samples < _TRANSCRIBE_EVERY_N_SAMPLES:
             return self.last_partial
 
+        self._pending_samples = 0
+
+        # Build context window (last ≤ 10 s)
+        ctx = np.concatenate(self._chunks)
+        if len(ctx) > _MAX_CONTEXT_SAMPLES:
+            ctx = ctx[-_MAX_CONTEXT_SAMPLES:]
+            self._chunks = [ctx]
+
+        # Delegate to the active ASR engine
+        try:
+            return self.engine.run_inference(ctx)
         except Exception as exc:
-            log.error("Inference error: %s", exc, exc_info=True)
+            log.error("Session inference error: %s", exc, exc_info=True)
             return self.last_partial   # keep last known good text
 
     # ── Main entry-point: called from WebSocket handler ───────────────────────
@@ -423,18 +402,31 @@ class StreamingSession:
         is_silent = self._rms(samples) < SILENCE_RMS_THRESHOLD
         partial   = self._run_inference(samples)
 
+        # Filter trivial engine outputs (silence artifacts like ".")
+        if partial.strip() in _TRIVIAL_OUTPUTS or len(partial.strip()) <= 1:
+            partial = self.last_partial  # keep showing last valid text
+
         self.silence_frames = (self.silence_frames + 1) if is_silent else 0
 
         # Endpointing — sustained silence → emit final
         if self.silence_frames >= SILENCE_FRAMES_TRIGGER and self.last_partial:
-            final = self.last_partial
+            final_text = self.last_partial
+            # Accumulate into the session transcript (full session text)
+            if final_text:
+                self._session_text = (self._session_text + " " + final_text).strip()
             self._reset_for_next_utterance()
-            return {"type": "final", "text": final}
+            return {"type": "final", "text": self._session_text or final_text}
+
+        # Build full display text: session history + current partial
+        if partial:
+            full_partial = (self._session_text + " " + partial).strip() if self._session_text else partial
+        else:
+            full_partial = self._session_text  # nothing new yet
 
         # Emit partial only when it changes
-        if partial and partial != self.last_partial:
-            self.last_partial = partial
-            return {"type": "partial", "text": partial}
+        if full_partial and full_partial != self.last_partial:
+            self.last_partial = full_partial
+            return {"type": "partial", "text": full_partial}
 
         return None
 
@@ -442,6 +434,7 @@ class StreamingSession:
         """Emit any pending partial as final (called on client 'end' signal)."""
         if self.last_partial:
             final = self.last_partial
+            self._session_text = ""
             self._reset_for_next_utterance()
             return {"type": "final", "text": final}
         return None
@@ -457,7 +450,7 @@ async def ws_transcribe(ws: WebSocket):
     log.info("Client connected   %s", client_id)
 
     loop    = asyncio.get_event_loop()
-    session = StreamingSession(asr_model)
+    session = StreamingSession(asr_engine)
 
     try:
         while True:

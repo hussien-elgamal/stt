@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ara-Nemotron · Real-time Streaming ASR</title>
-  <meta name="description" content="Real-time Arabic streaming speech recognition powered by Ara-Nemotron 0.6B on RTX 3080" />
+  <title>Dual-Engine ASR · Real-time Streaming</title>
+  <meta name="description" content="Real-time Arabic streaming speech recognition — switch between Ara-Nemotron and Qwen3-ASR" />
 
   <!-- Google Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -415,6 +415,79 @@
       pointer-events: none;
     }
     #toast.visible { transform: translateX(-50%) translateY(0); }
+    /* ─── Engine Switcher ──── */
+    .engine-switcher {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 6px;
+      backdrop-filter: blur(10px);
+    }
+    .engine-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      background: transparent;
+      color: var(--txt-secondary);
+      transition: var(--transition);
+      white-space: nowrap;
+    }
+    .engine-btn:hover:not(:disabled) {
+      color: var(--txt-primary);
+      background: var(--bg-card-hov);
+    }
+    .engine-btn.active {
+      background: linear-gradient(135deg, rgba(56,189,248,0.18), rgba(167,139,250,0.18));
+      color: var(--accent-cyan);
+      border: 1px solid rgba(56,189,248,0.25);
+    }
+    .engine-btn.active.qwen-active {
+      background: linear-gradient(135deg, rgba(167,139,250,0.18), rgba(244,114,182,0.18));
+      color: var(--accent-purple);
+      border: 1px solid rgba(167,139,250,0.25);
+    }
+    .engine-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .engine-icon { font-size: 0.9rem; }
+    .engine-divider {
+      width: 1px;
+      height: 16px;
+      background: var(--border);
+      flex-shrink: 0;
+    }
+
+    /* Switching overlay spinner */
+    .engine-spinner {
+      display: none;
+      width: 14px; height: 14px;
+      border: 2px solid rgba(56,189,248,0.2);
+      border-top-color: var(--accent-cyan);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .engine-switcher.switching .engine-spinner { display: block; }
+    .engine-switcher.switching .engine-btn     { opacity: 0.4; pointer-events: none; }
+
+    /* Switch toast */
+    .switch-msg {
+      font-size: 0.65rem;
+      color: var(--txt-secondary);
+      white-space: nowrap;
+      padding: 0 4px;
+      display: none;
+    }
+    .engine-switcher.switching .switch-msg { display: block; }
   </style>
 </head>
 
@@ -424,9 +497,23 @@
   <!-- ── Header ──────────────────────────────────────────────────────────── -->
   <header>
     <div class="logo-area">
-      <h1>Ara-Nemotron ASR</h1>
-      <p>FastConformer-RNNT · 0.6B · Real-time Streaming · Arabic / Egyptian Arabic</p>
+      <h1>Dual-Engine ASR</h1>
+      <p id="engineSubtitle">Real-time Streaming &middot; Arabic &middot; Loading engine&hellip;</p>
     </div>
+
+    <!-- Engine Switcher -->
+    <div class="engine-switcher" id="engineSwitcher">
+      <div class="engine-spinner"></div>
+      <span class="switch-msg">Switching&hellip;</span>
+      <button class="engine-btn" id="btnNemo" onclick="switchEngine('nemotron')" title="Ara-Nemotron (NVIDIA NeMo RNNT)">
+        <span class="engine-icon">&#9889;</span> Nemotron
+      </button>
+      <div class="engine-divider"></div>
+      <button class="engine-btn" id="btnQwen" onclick="switchEngine('qwen')" title="Qwen3-ASR-0.6B (HuggingFace)">
+        <span class="engine-icon">&#128302;</span> Qwen
+      </button>
+    </div>
+
     <div class="conn-badge" id="connBadge">
       <span class="conn-dot"></span>
       <span id="connLabel">Disconnected</span>
@@ -844,6 +931,73 @@ async function stopRecording() {
   btnLabel.textContent = 'Start Recording';
 }
 
+/* ─── Engine Switcher ───────────────────────────────────────────────────── */
+const engineSwitcher = document.getElementById('engineSwitcher');
+const btnNemo         = document.getElementById('btnNemo');
+const btnQwen         = document.getElementById('btnQwen');
+const engineSubtitle  = document.getElementById('engineSubtitle');
+
+const ENGINE_LABELS = {
+  nemotron : { label: 'Ara-Nemotron (NeMo RNNT)', btn: () => btnNemo, css: '' },
+  qwen     : { label: 'Qwen3-ASR (HuggingFace)',  btn: () => btnQwen, css: 'qwen-active' },
+};
+
+function setActiveEngine(key) {
+  const info = ENGINE_LABELS[key] || ENGINE_LABELS.nemotron;
+  // Toggle active class
+  btnNemo.classList.toggle('active',       key === 'nemotron');
+  btnNemo.classList.toggle('qwen-active',  false);
+  btnQwen.classList.toggle('active',       key === 'qwen');
+  btnQwen.classList.toggle('qwen-active',  key === 'qwen');
+  engineSubtitle.textContent = info.label + ' · Real-time Streaming · Arabic';
+}
+
+async function fetchEngineStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    setActiveEngine(data.engine_key || 'nemotron');
+  } catch (_) {}
+}
+
+async function switchEngine(engineKey) {
+  if (engineSwitcher.classList.contains('switching')) return;
+  const info = ENGINE_LABELS[engineKey];
+  if (!info) return;
+
+  // Optimistic UI — show switching state
+  engineSwitcher.classList.add('switching');
+
+  try {
+    const r = await fetch('/api/switch-engine', {
+      method : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body   : JSON.stringify({ engine: engineKey }),
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      showToast('Switch failed: ' + (data.detail || r.statusText));
+      return;
+    }
+
+    setActiveEngine(engineKey);
+    showToast('Engine switched to ' + info.label);
+
+    // Reconnect WebSocket so the new session uses the new engine
+    if (isRecording) await stopRecording();
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    setTimeout(connectWS, 400);
+
+  } catch (err) {
+    showToast('Network error: ' + err.message);
+  } finally {
+    engineSwitcher.classList.remove('switching');
+  }
+}
+
 /* ─── Button click ───────────────────────────────────────────────────────── */
 recordBtn.addEventListener('click', () => {
   if (!isRecording) startRecording();
@@ -851,6 +1005,7 @@ recordBtn.addEventListener('click', () => {
 });
 
 /* ─── Boot ───────────────────────────────────────────────────────────────── */
+fetchEngineStatus();
 connectWS();
 </script>
 </body>

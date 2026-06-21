@@ -1,0 +1,6 @@
+setup.py
+texterrors/__init__.py
+texterrors.egg-info/PKG-INFO
+texterrors.egg-info/SOURCES.txt
+texterrors.egg-info/dependency_links.txt
+texterrors.egg-info/top_level.txt

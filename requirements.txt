@@ -1,12 +1,14 @@
-# ─────────────────────────────────────────────────────────────────
-#  Ara-Nemotron Streaming ASR — Pinned Requirements (Windows CUDA)
+# -----------------------------------------------------------------
+#  Dual-Engine Streaming ASR - Pinned Requirements (Windows CUDA)
+#  Engine A: Ara-Nemotron (NeMo)
+#  Engine B: Qwen3-ASR    (HuggingFace Transformers)
 #  Tested: Python 3.11  |  torch 2.5.1+cu121  |  RTX 3080
 #
-#  CRITICAL VERSION PINS — Do NOT upgrade without testing:
+#  CRITICAL VERSION PINS - Do NOT upgrade without testing:
 #    pyarrow  must stay  < 18  (>= 24 causes Windows access violation)
 #    datasets must stay  < 3   (3.x requires pyarrow >= 21)
 #    numpy    must stay  < 2   (NeMo C-extensions break with numpy 2.x)
-# ─────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------
 
 # Web Framework
 fastapi>=0.111.0
@@ -14,13 +16,18 @@ uvicorn[standard]>=0.29.0
 websockets>=12.0
 python-multipart>=0.0.9
 
-# NeMo ASR (heavy — installs torch deps, apex, etc.)
+# -- Engine A: NeMo ASR (heavy - installs torch deps, apex, etc.) --
 nemo_toolkit[asr]>=2.0.0
 
-# ⚠️  PINNED — Do NOT change these three without reading the notes above
+# PINNED - Do NOT change these three without reading the notes above
 numpy>=1.24.0,<2.0.0
 pyarrow>=17.0.0,<18.0.0
 datasets>=2.18.0,<3.0.0
+
+# -- Engine B: HuggingFace Transformers (Qwen3-ASR / SenseVoice) --
+# Requires transformers >= 4.45 for Qwen2-Audio / Qwen3-ASR support
+transformers>=4.45.0
+accelerate>=0.26.0   # required by from_pretrained(low_cpu_mem_usage=True)
 
 # Utilities
 scipy>=1.11.0
